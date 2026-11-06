@@ -35,6 +35,7 @@ import os
 import shutil
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
@@ -79,6 +80,9 @@ class DepthOptions:
     point_stride: int = 2             # fuse every n-th reference pixel per axis (Pix4D "optimal" density)
     cache_mb: int = 1200              # decoded-image cache for matching (8 GB machines: keep ~1.2 GB)
     workers: int = 0
+    cloud_on_disk: bool = True        # fused points go to <out>/dense_cloud and are mapped back read-only, so
+                                      # the cloud takes page cache, not process memory (any block size)
+    gpu: object = None                # backend with `depth_sweep` (CUDA): the plane sweep runs there, same result
 
 
 @dataclass
@@ -299,10 +303,13 @@ def _rays_world(shape, cam_r):
 
 class _Hypotheses:
     """Inverse-depth hypothesis maps generated one at a time (``make(i)``) instead of a list
-    holding all of them (up to 3 x 64 coarse maps per image and worker)."""
+    holding all of them (up to 3 x 64 coarse maps per image and worker).
 
-    def __init__(self, make, n):
-        self._make, self._n = make, n
+    `spec` describes the family so a GPU can generate the same float32 maps itself:
+    ("linear", base, step) -> base + i * step, ("refine", iu, ds, rs) -> max(iu + (i - rs) * ds, 1e-6)."""
+
+    def __init__(self, make, n, spec=None):
+        self._make, self._n, self.spec = make, n, spec
 
     def __len__(self):
         return self._n
@@ -319,7 +326,8 @@ def _sweep(ref, cam_r, srcs, cams_s, inv_list, opt, ray=None):
     neighbours. The warp + NCC of every source and the top-k / winner bookkeeping run in one C
     kernel per hypothesis (``_dense.sweep_hypothesis``, bit-identical to ``_dense.ncc_warp`` per
     source followed by ``_dense.combine``) that releases the GIL; memory does not grow with the
-    number of hypotheses."""
+    number of hypotheses. With ``opt.gpu`` (CUDA) the same kernels run on the GPU with the same
+    arithmetic, so the depth map is the same."""
     r = opt.window
     H, W = ref.shape
     if ray is None:
@@ -333,7 +341,14 @@ def _sweep(ref, cam_r, srcs, cams_s, inv_list, opt, ray=None):
     s_next_best = np.full((H, W), -2.0, np.float32)
     prev = np.full((H, W), -2.0, np.float32)
     idx = np.full((H, W), -1, np.int32)
-    if 1 <= len(srcs) <= 16 and hasattr(_dense, "sweep_hypothesis"):
+    on_gpu = None
+    if 1 <= len(srcs) <= 16 and getattr(opt, "gpu", None) is not None:
+        G = np.array([np.r_[Rs.ravel(), b, [cs.f, cs.k1, cs.k2, cs.k3, cs.cx, cs.cy]]
+                      for cs, (Rs, b) in zip(cams_s, geo)], np.float64)
+        on_gpu = opt.gpu.depth_sweep(ref, mu, sd, srcs, ray, G, inv_list, r, opt.top_k)
+    if on_gpu is not None:                                  # None: no GPU, or it had no memory: CPU below
+        best, s_prev_best, s_next_best, idx = on_gpu
+    elif 1 <= len(srcs) <= 16 and hasattr(_dense, "sweep_hypothesis"):
         G = np.array([np.r_[Rs.ravel(), b, [cs.f, cs.k1, cs.k2, cs.k3, cs.cx, cs.cy]]
                       for cs, (Rs, b) in zip(cams_s, geo)], np.float64)
         for i in range(len(inv_list)):
@@ -409,9 +424,11 @@ def depth_map(k, nbrs, rec, views, opt: DepthOptions):
     # over a much narrower range where the surface is known (finer steps, no pattern aliasing)
     inv_lo, inv_hi = _depth_band(rec, k, pyr_c[L], shape, rng, block=max(8, shape[1] // 16))
     step = (inv_hi - inv_lo) / max(nd - 1, 1)
+    f32 = inv_lo.dtype == np.float32 and step.dtype == np.float32
     d, _, _ = _sweep(pyr_r[L], pyr_c[L], pyr_s[L], pyr_cs[L],
                      _Hypotheses((lambda i: _fast.hyp_linear(inv_lo, step, i)) if _fast is not None else
-                                 (lambda i: (inv_lo + i * step).astype(np.float32)), nd), opt, rays[L])
+                                 (lambda i: (inv_lo + i * step).astype(np.float32)), nd,
+                                 ("linear", inv_lo, step) if f32 else None), opt, rays[L])
     dstep = step / 2
     # refine: at each finer level search +-refine_steps around the upsampled depth, half the spacing
     for lvl in range(L - 1, -1, -1):
@@ -422,8 +439,9 @@ def depth_map(k, nbrs, rec, views, opt: DepthOptions):
         dstep = np.pad(dstep, ((0, H - dstep.shape[0]), (0, W - dstep.shape[1])), mode="edge")
         iu, rs_ = np.ascontiguousarray(1.0 / up), opt.refine_steps
         if _fast is not None and iu.dtype == np.float32 and dstep.dtype == np.float32:
-            hyp = _Hypotheses(lambda q, iu=iu, ds=np.ascontiguousarray(dstep): _fast.hyp_refine(iu, ds, q - rs_),
-                              2 * rs_ + 1)
+            ds_ = np.ascontiguousarray(dstep)
+            hyp = _Hypotheses(lambda q, iu=iu, ds=ds_: _fast.hyp_refine(iu, ds, q - rs_),
+                              2 * rs_ + 1, ("refine", iu, ds_, rs_))
         else:
             hyp = _Hypotheses(lambda q, iu=iu, ds=dstep: np.maximum(iu + (q - rs_) * ds, 1e-6).astype(np.float32),
                               2 * rs_ + 1)
@@ -503,14 +521,56 @@ def densify(ar, rec, gains: dict, biases: Optional[dict], out_dir: str, opt: Dep
     wd = os.path.join(out_dir, "depthmaps")
     shutil.rmtree(wd, ignore_errors=True)               # leftovers of an interrupted run
     os.makedirs(wd, exist_ok=True)
+    cloud_dir = os.path.join(out_dir, "dense_cloud") if opt.cloud_on_disk else None
     try:
-        return _densify(ar, rec, gains, biases, wd, opt)
+        return _densify(ar, rec, gains, biases, wd, opt, cloud_dir)
     finally:
         if not opt.keep_depthmaps:
             shutil.rmtree(wd, ignore_errors=True)
 
 
-def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
+class _CloudWriter:
+    """The fused points, appended to one file per field (`path`) or kept in lists (`path` None).
+    `finish()` returns the four arrays; from files they are read-only memory maps whose files are
+    unlinked at once (POSIX), so the cloud costs page cache instead of process memory and the
+    kernel drops it under pressure: the block size no longer bounds the machine's memory."""
+    FIELDS = (("xyz", np.float64, 3), ("rgb", np.uint8, 3), ("views", np.uint8, 0), ("cam", np.int32, 0))
+
+    def __init__(self, path: Optional[str]):
+        self.path, self.n = path, 0
+        self.parts = [[] for _ in self.FIELDS]
+        if path is not None:
+            shutil.rmtree(path, ignore_errors=True)
+            os.makedirs(path)
+            self.files = [open(os.path.join(path, name), "wb") for name, _, _ in self.FIELDS]
+
+    def add(self, *arrays):
+        for j, ((_, dt, _), a) in enumerate(zip(self.FIELDS, arrays)):
+            a = np.ascontiguousarray(a, dt)
+            if self.path is None:
+                self.parts[j].append(a)
+            else:
+                a.tofile(self.files[j])
+        self.n += len(arrays[0])
+
+    def finish(self):
+        if self.path is None:
+            return [np.concatenate(p) for p in self.parts] if self.n else None
+        for f in self.files:
+            f.close()
+        out = None
+        if self.n:
+            out = [np.memmap(os.path.join(self.path, name), dtype=dt, mode="r", shape=(self.n, w) if w else (self.n,))
+                   for name, dt, w in self.FIELDS]
+        try:                                         # mapped pages stay valid after the unlink (POSIX)
+            shutil.rmtree(self.path)
+        except OSError:                              # Windows: mapped files cannot be removed yet
+            if out is not None:
+                weakref.finalize(out[0], shutil.rmtree, self.path, True)
+        return out
+
+
+def _densify(ar, rec, gains, biases, wd, opt, cloud_dir=None) -> DenseCloud:
     frames = ar.frames
     N = len(rec.used)
     workers = opt.workers or ar.workers or os.cpu_count()
@@ -556,6 +616,9 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
                                / cams[k].f for k in range(N) if np.any(rec.obs_cam == k)]))
     log.info("Densify: %d depth maps at %.2f image scale (~%.3f m/px), %d neighbours, %d hypotheses",
              N, float(np.median(list(scales.values()))), med_gsd, opt.neighbors, opt.num_depths)
+    if opt.gpu is not None:
+        log.info("Depth maps: plane sweep on the GPU (%s), bit-identical to the CPU",
+                 getattr(opt.gpu, "device_name", "GPU"))
 
     done = 0
     step = max(1, N // 20)
@@ -584,9 +647,18 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
     log.info("Densify settings (auto): consistency %.2f px, min views %d, PatchMatch %s",
              px_tol, min_views, "on" if opt.patchmatch else "off")
 
+    # without PatchMatch the repair pass only applies the final filter, which needs nothing but the
+    # image's own map: apply it here and write the final map once instead of three raw files that
+    # a second pass reads back (the score is compared at the float16 precision that pass read)
+    filter_now = not opt.patchmatch and not opt.keep_depthmaps
+
     def job(k):
         r = depth_map(k, nbrs[k], rec, views, opt)
-        if r is not None:
+        if r is not None and filter_now:
+            D = r[0]
+            D[(r[1].astype(np.float16).astype(np.float32) < opt.min_ncc) | r[2]] = np.nan
+            np.save(os.path.join(wd, f"{k:05d}.npy"), D)
+        elif r is not None:
             np.save(os.path.join(wd, f"p{k:05d}.npy"), r[0])
             np.save(os.path.join(wd, f"s{k:05d}.npy"), r[1].astype(np.float16))
             np.save(os.path.join(wd, f"t{k:05d}.npy"), r[2])
@@ -601,8 +673,43 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
             if done % step == 0 or done == N:
                 log.info("  dense: %d/%d depth maps", done, N)
     log.info("Depth maps done in %.1fs (%d/%d images)", time.time() - t0, len(have), N)
+    if opt.gpu is not None and hasattr(opt.gpu, "depth_stats"):
+        log.info("  plane sweeps: %d on the GPU, %d on the CPU (did not fit the GPU)", *opt.gpu.depth_stats())
 
-    # ---- pass 2: geometric check against the neighbours + PatchMatch repair + final filter
+    if filter_now:
+        cache.clear()
+        log.info("Depth maps filtered as they were made (PatchMatch off): no repair pass")
+    else:
+        _repair_pass(have, wd, nbrs, cams, rec, views, cache, opt, px_tol, min_views, rel_tols, workers, step)
+
+    # ---- geometric consistency + fusion (sequential: pixels fused once are marked as used)
+    t1 = time.time()
+    log.info("Fusing depth maps (>= %d agreeing images per point)", min_views)
+    dm = {k: np.load(os.path.join(wd, f"{k:05d}.npy"), mmap_mode="r") for k in have}
+    st_ = max(1, opt.point_stride)
+    # pixels are only ever fused or marked on the stride grid, so the marks live on that grid
+    used = {k: np.zeros((-(-dm[k].shape[0] // st_), -(-dm[k].shape[1] // st_)), bool) for k in have}
+    writer = _CloudWriter(cloud_dir)
+    fpool = ThreadPoolExecutor(max(1, min(workers, opt.neighbors or 1)))
+    try:
+        _fuse(sorted(have), dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache,
+              writer, step, fpool)
+    finally:
+        fpool.shutdown()
+    del dm, used
+    arrays = writer.finish()
+    if arrays is None:
+        raise RuntimeError("Densification produced no consistent points: too little overlap or texture "
+                           "(try min_views=2 or a larger max_image_dim)")
+    cloud = DenseCloud(*arrays, med_gsd * max(1, opt.point_stride))
+    log.info("Dense cloud: %d points (median %d views/point) fused in %.1fs",
+             len(cloud.xyz), int(np.median(cloud.views)), time.time() - t1)
+    return cloud
+
+
+def _repair_pass(have, wd, nbrs, cams, rec, views, cache, opt, px_tol, min_views, rel_tols, workers, step):
+    """Pass 2 with PatchMatch (or with the raw maps kept): geometric check against the neighbours,
+    PatchMatch repair, final filter."""
     t2 = time.time()
     raw = {k: np.load(os.path.join(wd, f"p{k:05d}.npy"), mmap_mode="r") for k in have}
     stats = {"repaired": 0, "active": 0, "pixels": 0}
@@ -650,55 +757,29 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
     log.info("Depth-map repair done in %.1fs (%d of %d pixels re-estimated by PatchMatch)",
              time.time() - t2, stats["active"], stats["pixels"])
 
-    # ---- geometric consistency + fusion (sequential: pixels fused once are marked as used)
-    t1 = time.time()
-    log.info("Fusing depth maps (>= %d agreeing images per point)", min_views)
-    dm = {k: np.load(os.path.join(wd, f"{k:05d}.npy"), mmap_mode="r") for k in have}
-    used = {k: np.zeros(dm[k].shape, bool) for k in have}
-    pts, cols, nv, owner = [], [], [], []
-    fpool = ThreadPoolExecutor(max(1, min(workers, opt.neighbors or 1)))
-    try:
-        _fuse(sorted(have), dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache,
-              pts, cols, nv, owner, step, fpool)
-    finally:
-        fpool.shutdown()
-    del dm
-    if not pts:
-        raise RuntimeError("Densification produced no consistent points: too little overlap or texture "
-                           "(try min_views=2 or a larger max_image_dim)")
-    cloud = DenseCloud(np.concatenate(pts), np.concatenate(cols), np.concatenate(nv), np.concatenate(owner),
-                       med_gsd * max(1, opt.point_stride))
-    log.info("Dense cloud: %d points (median %d views/point) fused in %.1fs",
-             len(cloud.xyz), int(np.median(cloud.views)), time.time() - t1)
-    return cloud
 
-
-def _fuse(order, dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache, pts, cols, nv, owner,
-          step, fpool):
+def _fuse(order, dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache, writer, step, fpool):
     """Sequential geometric-consistency fusion (pixels fused once are marked as used). The next
     reference image is decoded in the background while the current one is fused."""
     pre = ThreadPoolExecutor(1)
     try:
-        _fuse_loop(order, dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache, pts, cols, nv,
-                   owner, step, fpool, pre)
+        _fuse_loop(order, dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache, writer, step,
+                   fpool, pre)
     finally:
         pre.shutdown()
 
 
-def _fuse_loop(order, dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache, pts, cols, nv,
-               owner, step, fpool, pre):
+def _fuse_loop(order, dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache, writer, step,
+               fpool, pre):
+    st_ = max(1, opt.point_stride)                       # one point per stride x stride pixels
     nxt = pre.submit(views, order[0]) if order else None
     for n_done, k in enumerate(order):
         cur, nxt = nxt, (pre.submit(views, order[n_done + 1]) if n_done + 1 < len(order) else None)
         D = np.asarray(dm[k])
         cr = cams[k]
         tol_k = rel_tols(k)
-        cand = np.isfinite(D) & ~used[k]
-        if opt.point_stride > 1:                         # one point per stride x stride pixels
-            sub = np.zeros_like(cand)
-            sub[::opt.point_stride, ::opt.point_stride] = True
-            cand &= sub
-        vv, uu = (np.ascontiguousarray(a) for a in np.nonzero(cand))
+        vg, ug = np.nonzero(np.isfinite(D[::st_, ::st_]) & ~used[k])     # row-major, as on the full grid
+        vv, uu = np.ascontiguousarray(vg * st_), np.ascontiguousarray(ug * st_)
         if len(vv) == 0:
             continue
         nb_k = [j for j in nbrs[k] if j in have]
@@ -745,18 +826,15 @@ def _fuse_loop(order, dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_vie
         keep = cnt >= min_views
         if not keep.any():
             continue
-        st_ = max(1, opt.point_stride)
         for j, vi, ui, ok in marks:
             sel = keep[ok]
             # mark the stride-grid pixel that would emit this surface sample when j is the
             # reference (only those pixels are candidates); otherwise every overlapping photo
             # re-emits the same point
-            used[j][(vi[sel] // st_) * st_, (ui[sel] // st_) * st_] = True
+            used[j][vi[sel] // st_, ui[sel] // st_] = True
         _, rgb, _ = cur.result()
-        pts.append((acc[keep] / cnt[keep, None]))
-        cols.append(rgb[vv[keep], uu[keep]])
-        nv.append(np.minimum(cnt[keep], 255).astype(np.uint8))
-        owner.append(np.full(int(keep.sum()), k, np.int32))
+        writer.add(acc[keep] / cnt[keep, None], rgb[vv[keep], uu[keep]],
+                   np.minimum(cnt[keep], 255).astype(np.uint8), np.full(int(keep.sum()), k, np.int32))
         cache.clear()
         if (n_done + 1) % step == 0:
             log.info("  fusion: %d/%d", n_done + 1, len(have))
@@ -852,9 +930,85 @@ def radius_steps(spacing: float, steps: int = 3, multiplier: float = 1.0) -> lis
     return r
 
 
+RASTER_CHUNK = 1 << 23           # cloud points read at a time
+RASTER_BAND_POINTS = 1 << 25     # points per band of DSM rows (~1 GB with the top-layer kernel's buffers)
+RASTER_BAND_CELLS = 1 << 26      # cells per band (the kernel keeps ~20 bytes per cell)
+
+
+def _grid_cells(xyz, minX, maxY, W, H, gsd):
+    """(col, row, inside) of points on the DSM grid, with rasterize's arithmetic."""
+    col = np.floor((xyz[:, 0] - minX) / gsd).astype(np.int64)
+    row = np.floor((maxY - xyz[:, 1]) / gsd).astype(np.int64)
+    return col, row, (col >= 0) & (col < W) & (row >= 0) & (row < H)
+
+
+def _row_bands(per_row: np.ndarray, W: int, max_points: int, max_cells: int) -> list:
+    """Consecutive (r0, r1) row ranges with at most `max_points` points and `max_cells` cells each
+    (a single row is never split)."""
+    rows_cap = max(1, max_cells // max(W, 1))
+    bands, r0, n = [], 0, 0
+    for r, c in enumerate(per_row.tolist()):
+        if r > r0 and (n + c > max_points or r - r0 >= rows_cap):
+            bands.append((r0, r))
+            r0, n = r, 0
+        n += c
+    bands.append((r0, len(per_row)))
+    return bands
+
+
+def _band_points(cloud, minX, maxY, W, H, gsd, max_points, max_cells, scratch_dir):
+    """Yield (r0, r1, cell, z, rgb) per band of DSM rows: cell int64 within the band, z float64,
+    rgb uint8 (n, 3), points in the cloud's order."""
+    n = len(cloud.xyz)
+    chunks = [(s, min(n, s + RASTER_CHUNK)) for s in range(0, n, RASTER_CHUNK)]
+    per_row = np.zeros(H, np.int64)
+    for s, e in chunks:
+        _, row, ok = _grid_cells(cloud.xyz[s:e], minX, maxY, W, H, gsd)
+        per_row += np.bincount(row[ok], minlength=H)
+    bands = _row_bands(per_row, W, max_points, max_cells)
+    if len(bands) == 1:                              # fits: gather in memory, no spill
+        parts = [(np.zeros(0, np.int64), np.zeros(0, np.float64), np.zeros((0, 3), np.uint8))]
+        for s, e in chunks:
+            col, row, ok = _grid_cells(cloud.xyz[s:e], minX, maxY, W, H, gsd)
+            parts.append(((row * W + col)[ok], np.asarray(cloud.xyz[s:e, 2])[ok], np.asarray(cloud.rgb[s:e])[ok]))
+        cell, z, rgb = (np.concatenate(p) if len(p) > 2 else p[-1] for p in zip(*parts))
+        del parts
+        yield 0, H, np.ascontiguousarray(cell, np.int64), np.ascontiguousarray(z, np.float64), np.ascontiguousarray(rgb)
+        return
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="dsm_bands_", dir=scratch_dir)
+    try:
+        files = [[open(os.path.join(tmp, f"{b}.{f}"), "wb") for f in ("c", "z", "rgb")] for b in range(len(bands))]
+        starts = np.array([b[0] for b in bands], np.int64)
+        for s, e in chunks:
+            col, row, ok = _grid_cells(cloud.xyz[s:e], minX, maxY, W, H, gsd)
+            band = np.searchsorted(starts, row, side="right") - 1
+            z = np.asarray(cloud.xyz[s:e, 2])
+            rgb = np.asarray(cloud.rgb[s:e])
+            for b in np.unique(band[ok]).tolist():
+                sel = ok & (band == b)
+                ((row[sel] - starts[b]) * W + col[sel]).tofile(files[b][0])
+                np.ascontiguousarray(z[sel], np.float64).tofile(files[b][1])
+                np.ascontiguousarray(rgb[sel], np.uint8).tofile(files[b][2])
+            del col, row, ok, band, z, rgb
+        for fs in files:
+            for f in fs:
+                f.close()
+        for b, (r0, r1) in enumerate(bands):
+            cell = np.fromfile(os.path.join(tmp, f"{b}.c"), np.int64)
+            z = np.fromfile(os.path.join(tmp, f"{b}.z"), np.float64)
+            rgb = np.fromfile(os.path.join(tmp, f"{b}.rgb"), np.uint8).reshape(-1, 3)
+            for f in ("c", "z", "rgb"):
+                os.remove(os.path.join(tmp, f"{b}.{f}"))
+            yield r0, r1, cell, z, rgb
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def rasterize(cloud: DenseCloud, minX: float, maxY: float, W: int, H: int, gsd: float,
               layer_gap: float = 1.0, covered: Optional[np.ndarray] = None,
-              radii: Optional[list] = None) -> DenseResult:
+              radii: Optional[list] = None, band_points: Optional[int] = None,
+              band_cells: Optional[int] = None, scratch_dir: Optional[str] = None) -> DenseResult:
     """Top-layer DSM from the dense cloud: per cell the median height (mean colour) of the points within
     `layer_gap` of the cell's highest point (roof points are never mixed with wall or ground
     points below them; ``_dense.top_layer``).
@@ -863,22 +1017,21 @@ def rasterize(cloud: DenseCloud, minX: float, maxY: float, W: int, H: int, gsd: 
     the current radius of measured cells takes the *lower median* of its measured neighbours, so
     no value is averaged across a height step. `score` is 1 for cells with points or within the
     first radius (the point footprint), 0.25 for cells filled at a larger radius (reported as
-    interpolated), 0 elsewhere."""
-    col = np.floor((cloud.xyz[:, 0] - minX) / gsd).astype(np.int64)
-    row = np.floor((maxY - cloud.xyz[:, 1]) / gsd).astype(np.int64)
-    ok = (col >= 0) & (col < W) & (row >= 0) & (row < H)
-    cell = (row * W + col)[ok]
-    # work on the occupied cells only (memory ~ points, not ~ raster): C top-layer kernel
-    uc, inv = np.unique(cell, return_inverse=True)
-    del cell, col, row
-    Zc, RGBc, _ = _dense.top_layer(np.ascontiguousarray(inv, np.int64), np.ascontiguousarray(cloud.xyz[ok, 2]),
-                                   np.ascontiguousarray(cloud.rgb[ok]), len(uc), float(layer_gap))
-    del inv
+    interpolated), 0 elsewhere.
+
+    The cloud is read in chunks and the top layer is computed in bands of DSM rows holding at most
+    `band_points` points and `band_cells` cells, so memory follows the band, not the block: large
+    clouds (memory-mapped from disk by `densify`) spill each band's points to `scratch_dir` in one
+    pass. Every cell sees its points in the cloud's order, so the DSM does not depend on the bands."""
     Z = np.full((H, W), np.nan, np.float32)
-    Z.ravel()[uc] = Zc
     RGB = np.zeros((H, W, 3), np.uint8)
-    RGB.reshape(-1, 3)[uc] = RGBc
-    del uc, Zc, RGBc
+    for r0, r1, cell, z, rgb in _band_points(cloud, minX, maxY, W, H, gsd, band_points or RASTER_BAND_POINTS,
+                                             band_cells or RASTER_BAND_CELLS, scratch_dir):
+        Zc, RGBc, _ = _dense.top_layer(cell, z, rgb, (r1 - r0) * W, float(layer_gap))
+        del cell, z, rgb
+        Z[r0:r1] = Zc.reshape(r1 - r0, W)
+        RGB[r0:r1] = RGBc.reshape(r1 - r0, W, 3)
+        del Zc, RGBc
     score = np.isfinite(Z).astype(np.float32)
 
     grown = 0

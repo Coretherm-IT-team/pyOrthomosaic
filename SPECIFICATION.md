@@ -526,7 +526,10 @@ Compiled from `.pyx`; GIL-releasing, called through the backends.
   semi-global matching), `bilateral` (edge-preserving surface filter).
 
 Equivalent CUDA and MLX kernels live in `_cuda.py` and `_mlx.py`; `tests/test_backends.py` checks
-every GPU kernel against the CPU implementation.
+every GPU kernel against the CPU implementation. The CUDA plane sweep of the depth maps lives in
+`_gpu_depth.py` (plain CUDA C, compiled with `--fmad=false`): it reproduces
+`_dense.sweep_hypothesis` bit for bit, which `tests/test_gpu_depth.py` checks on the device and,
+by compiling the same source with a C++ compiler, on any machine.
 
 ---
 

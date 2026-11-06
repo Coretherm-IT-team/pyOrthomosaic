@@ -2,8 +2,12 @@
 so no nvcc / toolkit build step is required -- only a driver + cupy wheel."""
 from __future__ import annotations
 
+import logging
+
 import cupy as cp
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 _SRC = r"""
 extern "C" __global__
@@ -142,6 +146,30 @@ class CUDABackend:
         free, total = cp.cuda.runtime.memGetInfo()
         self.free_mem = free
         self._self_test()
+        self._depth = None
+        try:                                   # depth maps: only when bit-identical to the CPU here
+            from ._gpu_depth import GPUDepthSweep
+            depth = GPUDepthSweep(cp)
+            depth.self_test()
+            self._depth = depth
+        except Exception as exc:
+            msg = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            log.warning("GPU depth maps unavailable (%s): depth maps run on the CPU", msg)
+
+    @property
+    def depth_on_gpu(self) -> bool:
+        return self._depth is not None
+
+    def depth_sweep(self, ref, mu, sd, srcs, ray, G, hyps, r, top_k):
+        """densify._sweep's hypothesis loop on the GPU, bit-identical to the CPU
+        (``_gpu_depth.GPUDepthSweep``); None runs it on the CPU."""
+        if self._depth is None:
+            return None
+        return self._depth.sweep(ref, mu, sd, srcs, ray, G, hyps, r, top_k)
+
+    def depth_stats(self) -> tuple:
+        """(sweeps run on the GPU, sweeps sent back to the CPU)."""
+        return (0, 0) if self._depth is None else (self._depth.sweeps, self._depth.cpu_fallbacks)
 
     def _self_test(self):
         """Compile and run every kernel (and the CuPy ops the pipeline uses) once, so any

@@ -487,7 +487,8 @@ def _products(ar, rec, out_dir, opt, t0, surface: Optional[Surface] = None,
         cloud = densify(ar, rec, gains, biases, out_dir,
                         DepthOptions(max_image_dim=opt.depth_max_image, neighbors=opt.depth_neighbors,
                                      min_views=opt.depth_min_views, patchmatch=opt.depth_patchmatch,
-                                     workers=ar.workers))
+                                     workers=ar.workers,
+                                     gpu=ar.backend if getattr(ar.backend, "depth_on_gpu", False) else None))
         from .densify import camera_coverage, radius_steps
         if opt.dsm_resolution is None:
             # one DSM cell per ~dense point: every cell can be measured instead of interpolated
@@ -499,7 +500,7 @@ def _products(ar, rec, out_dir, opt, t0, surface: Optional[Surface] = None,
                  W, H, gsd, ", ".join(f"{r:.3f}" for r in radii))
         # holes may only be filled where >= 2 calibrated photos actually see the ground
         dense = rasterize(cloud, minX, maxY, W, H, gsd, radii=radii,
-                          covered=camera_coverage(rec, minX, maxY, W, H, gsd, min_views=2))
+                          covered=camera_coverage(rec, minX, maxY, W, H, gsd, min_views=2), scratch_dir=out_dir)
         # products cover the reconstructed area only (ODM crops to the point cloud's hull); the
         # hull has straight edges, so the DSM and ortho borders are clean lines
         from .densify import cloud_footprint
@@ -700,10 +701,13 @@ def _products(ar, rec, out_dir, opt, t0, surface: Optional[Surface] = None,
 
     # ---- dense point cloud: the fused 3D cloud (walls included) or, for the sweep, confident DSM cells
     s = max(1, opt.cloud_step)
+    want_cloud = "ply" in opt.formats or "las" in opt.formats or "laz" in opt.formats
     if cloud is not None:
+        # views of the (memory-mapped) cloud; the per-point arrays below are only made for an export
         xyz, col = cloud.xyz[::s], cloud.rgb[::s]
-        xs = np.clip(((xyz[:, 0] - dense.minX) / gsd).astype(np.int64), 0, dsm.shape[1] - 1)
-        ys = np.clip(((dense.maxY - xyz[:, 1]) / gsd).astype(np.int64), 0, dsm.shape[0] - 1)
+        if "las" in opt.formats or "laz" in opt.formats:
+            xs = np.clip(((xyz[:, 0] - dense.minX) / gsd).astype(np.int64), 0, dsm.shape[1] - 1)
+            ys = np.clip(((dense.maxY - xyz[:, 1]) / gsd).astype(np.int64), 0, dsm.shape[0] - 1)
     else:
         ys, xs = np.nonzero(conf[::s, ::s])
         ys, xs = ys * s, xs * s
@@ -718,7 +722,7 @@ def _products(ar, rec, out_dir, opt, t0, surface: Optional[Surface] = None,
         outputs.update(dtm="dtm.tif", ndsm="ndsm.tif")
     if contours:                                     #changed here
         outputs["contours"] = "contours.geojson"
-    xyz_out = gw(xyz)
+    xyz_out = gw(xyz) if want_cloud else None
     if "ply" in opt.formats:
         export.write_ply(os.path.join(out_dir, "dense.ply"), xyz_out, col, offset3, f"EPSG:{epsg}" if epsg else "")
         outputs["dense_ply"] = "dense.ply"

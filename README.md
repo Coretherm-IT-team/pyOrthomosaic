@@ -178,12 +178,18 @@ offset to absolute altitude.
    - neighbours chosen for a ≥ 8° triangulation angle; 3 agreeing photos, or 2 at low overlap;
    - only flat, featureless windows are pre-rejected (low contrast is mostly still correct).
    Optional slanted-plane PatchMatch repair (`depth_patchmatch`, slow on CPU). Depth maps are
-   temporary and always deleted, also when a run fails.
+   temporary and always deleted, also when a run fails; without PatchMatch each map is filtered
+   as it is made (one file per photo, no second pass). With the CUDA backend the plane sweep runs
+   on the GPU, bit-identical to the CPU (`_gpu_depth.py`; checked on the device at start-up, else
+   the CPU is used). The fused cloud is written to `dense_cloud/` and memory-mapped back (the file
+   is removed at once), so it takes page cache, not process memory.
 4. **DSM** — on its own grid sized from the point spacing (`dsm_auto_factor` × spacing), so cells
    are measured rather than interpolated; per cell the median of the cloud's top layer (roofs never averaged with walls or
    ground below); empty cells filled from nearby points in radius steps (spacing × √2ᵏ); holes
    inside the area seen by ≥ 2 photos filled from the *lower* surrounding surface (no fake
-   ramps beside buildings); spike removal and edge-preserving smoothing.
+   ramps beside buildings); spike removal and edge-preserving smoothing. The top layer is
+   computed in bands of DSM rows (≤ 32 M points each, spilled to disk once when the cloud is
+   larger), so memory follows the DSM grid, not the number of points; the DSM is the same.
 5. **True orthophoto** — on its own, finer grid (native GSD, capped by `ortho_max_cells`), with
    the DSM resampled edge-aware (smooth on flat areas, nearest at height steps). Each cell is projected into photos chosen from different sides of
    the tile, tested for occlusion against the DSM, and scored (viewing angle, resolution, border
