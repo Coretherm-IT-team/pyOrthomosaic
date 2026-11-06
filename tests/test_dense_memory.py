@@ -85,9 +85,10 @@ def test_cloud_writer_disk_equals_memory():
                 mem.add(*p)
                 disk.add(*p)
         a, b = mem.finish(), disk.finish()
-        assert not os.path.exists(os.path.join(tmp, "dense_cloud")) or os.name == "nt"
+        assert not os.path.exists(os.path.join(tmp, "dense_cloud"))
         for x, y in zip(a, b):
-            assert isinstance(y, np.memmap) and same_bits(np.asarray(y), x)
+            assert (isinstance(y, np.memmap) or os.name == "nt") and same_bits(np.asarray(y), x)
+        del a, b, x, y                                # Windows: release the arrays before the folder goes
         assert _CloudWriter(None).finish() is None
         assert _CloudWriter(os.path.join(tmp, "empty")).finish() is None
 

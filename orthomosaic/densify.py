@@ -35,7 +35,6 @@ import os
 import shutil
 import threading
 import time
-import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
@@ -81,7 +80,8 @@ class DepthOptions:
     cache_mb: int = 1200              # decoded-image cache for matching (8 GB machines: keep ~1.2 GB)
     workers: int = 0
     cloud_on_disk: bool = True        # fused points go to <out>/dense_cloud and are mapped back read-only, so
-                                      # the cloud takes page cache, not process memory (any block size)
+                                      # the cloud takes page cache, not process memory (any block size;
+                                      # on Windows they are read back into memory)
     gpu: object = None                # backend with `depth_sweep` (CUDA): the plane sweep runs there, same result
 
 
@@ -533,7 +533,8 @@ class _CloudWriter:
     """The fused points, appended to one file per field (`path`) or kept in lists (`path` None).
     `finish()` returns the four arrays; from files they are read-only memory maps whose files are
     unlinked at once (POSIX), so the cloud costs page cache instead of process memory and the
-    kernel drops it under pressure: the block size no longer bounds the machine's memory."""
+    kernel drops it under pressure: the block size no longer bounds the machine's memory. Windows
+    cannot remove a mapped file, so there the files are read back into memory and removed."""
     FIELDS = (("xyz", np.float64, 3), ("rgb", np.uint8, 3), ("views", np.uint8, 0), ("cam", np.int32, 0))
 
     def __init__(self, path: Optional[str]):
@@ -560,13 +561,12 @@ class _CloudWriter:
             f.close()
         out = None
         if self.n:
-            out = [np.memmap(os.path.join(self.path, name), dtype=dt, mode="r", shape=(self.n, w) if w else (self.n,))
-                   for name, dt, w in self.FIELDS]
-        try:                                         # mapped pages stay valid after the unlink (POSIX)
-            shutil.rmtree(self.path)
-        except OSError:                              # Windows: mapped files cannot be removed yet
-            if out is not None:
-                weakref.finalize(out[0], shutil.rmtree, self.path, True)
+            out = []
+            for name, dt, w in self.FIELDS:
+                f, shape = os.path.join(self.path, name), ((self.n, w) if w else (self.n,))
+                out.append(np.fromfile(f, dt).reshape(shape) if os.name == "nt"
+                           else np.memmap(f, dtype=dt, mode="r", shape=shape))
+        shutil.rmtree(self.path)                     # mapped pages stay valid after the unlink (POSIX)
         return out
 
 

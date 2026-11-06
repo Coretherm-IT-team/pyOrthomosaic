@@ -182,7 +182,8 @@ offset to absolute altitude.
    as it is made (one file per photo, no second pass). With the CUDA backend the plane sweep runs
    on the GPU, bit-identical to the CPU (`_gpu_depth.py`; checked on the device at start-up, else
    the CPU is used). The fused cloud is written to `dense_cloud/` and memory-mapped back (the file
-   is removed at once), so it takes page cache, not process memory.
+   is removed at once), so it takes page cache, not process memory (on Windows it is read back
+   into memory).
 4. **DSM** — on its own grid sized from the point spacing (`dsm_auto_factor` × spacing), so cells
    are measured rather than interpolated; per cell the median of the cloud's top layer (roofs never averaged with walls or
    ground below); empty cells filled from nearby points in radius steps (spacing × √2ᵏ); holes
