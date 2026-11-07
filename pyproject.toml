@@ -36,7 +36,7 @@ packages = ["orthomosaic"]
 [tool.cibuildwheel]
 build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
 skip = "*-musllinux_i686 *-win32 *-manylinux_i686"
-test-command = "python {project}/tests/test_core.py && python {project}/tests/test_ba.py && python {project}/tests/test_3d.py && python {project}/tests/test_thermal.py && python {project}/tests/test_terrain.py && python {project}/tests/test_gcp.py && python {project}/tests/test_binding.py && python {project}/tests/test_coregister.py && python {project}/tests/test_color.py && python {project}/tests/test_backends.py && python {project}/tests/test_matching.py && python {project}/tests/test_native_parity.py"
+test-command = "python {project}/tests/test_core.py && python {project}/tests/test_ba.py && python {project}/tests/test_3d.py && python {project}/tests/test_thermal.py && python {project}/tests/test_terrain.py && python {project}/tests/test_gcp.py && python {project}/tests/test_binding.py && python {project}/tests/test_coregister.py && python {project}/tests/test_color.py && python {project}/tests/test_backends.py && python {project}/tests/test_matching.py && python {project}/tests/test_native_parity.py && python {project}/tests/test_gpu_depth.py && python {project}/tests/test_dense_memory.py"
 # numpy/pillow only ship recent-Linux (glibc >= 2.28) wheels now; build and test in the
 # matching image, and never let pip fall back to compiling a dependency from source.
 manylinux-x86_64-image = "manylinux_2_28"
