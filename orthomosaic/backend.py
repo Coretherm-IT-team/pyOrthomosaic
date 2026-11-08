@@ -182,6 +182,28 @@ def _select_mps(prefer):
         return None
 
 
+def release_memory():
+    """Hand freed memory back to the system: Python cycles, CuPy's device and pinned-host pools
+    (kept for reuse until freed) and MLX's buffer cache (Apple silicon: shared with the CPU).
+    Only touches GPU libraries that are already imported; safe to call at any time."""
+    import gc
+    import sys
+    gc.collect()
+    cp = sys.modules.get("cupy")
+    if cp is not None:
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+    mx = sys.modules.get("mlx.core")
+    if mx is not None:
+        try:
+            (getattr(mx, "clear_cache", None) or mx.metal.clear_cache)()
+        except Exception:
+            pass
+
+
 def select_backend(prefer: str = "auto"):
     """prefer: 'auto' (CUDA > Apple GPU > CPU) | 'cuda' | 'mps' | 'cpu'."""
     prefer = prefer.lower()

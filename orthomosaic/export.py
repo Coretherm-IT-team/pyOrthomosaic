@@ -172,8 +172,67 @@ def grid_mesh(Z: np.ndarray, valid: np.ndarray, minX: float, maxY: float, cell: 
     return V, F, UV
 
 
+def mesh_input(xyz: np.ndarray, rgb: np.ndarray, cam: np.ndarray, centers: np.ndarray, spacing: float,
+               max_points: int, chunk: int = 2_000_000):
+    """Reduce a dense cloud of any size to the Poisson input, in bounded memory.
+
+    Same reduction as the worker's Open3D ``voxel_down_sample`` (voxel size
+    ``max(spacing, sqrt(area / max_points))``, grid starting half a voxel below the cloud's
+    minimum, per-voxel mean of position, colour and viewing direction), but streamed over
+    `chunk` points at a time, so a memory-mapped cloud is never copied whole. Peak memory is
+    ~300 bytes per chunk point plus ~90 bytes per occupied voxel, whatever the cloud size.
+
+    `cam` indexes `centers` (camera centres): the viewing direction of each point.
+    Returns ``(xyz float64, rgb uint8, view_dirs float32, extent (3,))``; `extent` is the full
+    cloud's, for the worker's octree depth."""
+    n = len(xyz)
+    lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
+    for s in range(0, n, chunk):
+        a = np.asarray(xyz[s:s + chunk], np.float64)
+        lo, hi = np.minimum(lo, a.min(0)), np.maximum(hi, a.max(0))
+    ext = hi - lo
+    centers = np.asarray(centers, np.float64)
+
+    def vdirs(a, c):
+        d = centers[np.asarray(c)] - a
+        d /= np.linalg.norm(d, axis=1, keepdims=True)
+        return d
+
+    if n <= max_points:                      # small cloud: the worker takes it as is
+        a = np.asarray(xyz, np.float64)
+        return a, np.asarray(rgb, np.uint8), vdirs(a, cam).astype(np.float32), ext
+    area = max(float(ext[0] * ext[1]), 1e-6)
+    v = max(spacing, math.sqrt(area / max_points))
+    origin = lo - 0.5 * v
+    dims = np.floor((hi - origin) / v).astype(np.int64) + 1
+    keys = np.empty(0, np.int64)
+    sums = np.empty((0, 10), np.float64)     # x y z, r g b, view x y z, count
+
+    def reduce(k, vals):
+        u, inv = np.unique(k, return_inverse=True)
+        out = np.empty((len(u), vals.shape[1]), np.float64)
+        for j in range(vals.shape[1]):
+            out[:, j] = np.bincount(inv, weights=vals[:, j], minlength=len(u))
+        return u, out
+
+    for s in range(0, n, chunk):
+        a = np.asarray(xyz[s:s + chunk], np.float64)
+        idx = np.minimum(np.floor((a - origin) / v).astype(np.int64), dims - 1)
+        k = (idx[:, 0] * dims[1] + idx[:, 1]) * dims[2] + idx[:, 2]
+        vals = np.column_stack([a, np.asarray(rgb[s:s + chunk], np.float64),
+                                vdirs(a, cam[s:s + chunk]), np.ones(len(a))])
+        del a, idx
+        k, vals = reduce(k, vals)
+        keys, sums = reduce(np.concatenate([keys, k]), np.vstack([sums, vals]))
+        del k, vals
+    cnt = sums[:, 9:10]
+    return (sums[:, 0:3] / cnt, np.clip(np.rint(sums[:, 3:6] / cnt), 0, 255).astype(np.uint8),
+            (sums[:, 6:9] / cnt).astype(np.float32), ext)
+
+
 def poisson_mesh(xyz: np.ndarray, rgb: np.ndarray, view_dirs: np.ndarray, spacing: float,
-                 max_points: int = 3_000_000, max_vertices: int = 1_500_000, trim_quantile: float = 0.08):
+                 max_points: int = 3_000_000, max_vertices: int = 1_500_000, trim_quantile: float = 0.08,
+                 extent: Optional[np.ndarray] = None):
     """Screened Poisson surface from the dense cloud (Open3D). Returns (V, F, vertex_rgb uint8),
     or None when Open3D is missing or fails.
 
@@ -183,6 +242,9 @@ def poisson_mesh(xyz: np.ndarray, rgb: np.ndarray, view_dirs: np.ndarray, spacin
     camera that saw each point. The lowest-density vertices (`trim_quantile`) and triangles longer
     than 4x the point spacing are removed: that is surface Poisson invents where there are no
     points (the "bubble" effect over gaps and edges).
+
+    Pass a large cloud through `mesh_input` first (with ``max_points=len(reduced)`` and its
+    `extent`): the worker then gets ~max_points points instead of the whole cloud.
     """
     try:
         import open3d  # noqa: F401
@@ -192,11 +254,12 @@ def poisson_mesh(xyz: np.ndarray, rgb: np.ndarray, view_dirs: np.ndarray, spacin
     import subprocess
     import sys
     import tempfile
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         src, dst = os.path.join(td, "in.npz"), os.path.join(td, "out.npz")
+        ext = np.full(3, np.nan) if extent is None else np.asarray(extent, np.float64)
         np.savez(src, xyz=np.asarray(xyz, np.float64), rgb=np.asarray(rgb, np.uint8),
                  vdir=np.asarray(view_dirs, np.float32),
-                 args=np.array([spacing, max_points, max_vertices, trim_quantile], np.float64))
+                 args=np.array([spacing, max_points, max_vertices, trim_quantile, *ext], np.float64))
         r = subprocess.run([sys.executable, "-c", "from orthomosaic.export import _poisson_worker as w; "
                             "import sys; w(sys.argv[1], sys.argv[2])", src, dst],
                            capture_output=True, text=True)
@@ -205,19 +268,23 @@ def poisson_mesh(xyz: np.ndarray, rgb: np.ndarray, view_dirs: np.ndarray, spacin
             logging.getLogger(__name__).warning(
                 "Poisson meshing failed (exit %s): %s", r.returncode, (r.stderr or "").strip()[-300:])
             return None
-        z = np.load(dst)
-        return z["V"], z["F"], z["C"]
+        with np.load(dst) as z:              # closed before the folder is removed (Windows)
+            return z["V"], z["F"], z["C"]
 
 
 def _poisson_worker(src: str, dst: str):
     import open3d as o3d
-    z = np.load(src)
-    spacing, max_points, max_vertices, trim_q = z["args"]
+    with np.load(src) as z:                  # each z[...] re-reads the file: read every array once
+        args, xyz, rgb, vdir = z["args"], z["xyz"], z["rgb"], z["vdir"]
+    spacing, max_points, max_vertices, trim_q = args[:4]
+    ext = args[4:7] if len(args) >= 7 and np.all(np.isfinite(args[4:7])) else np.ptp(xyz, axis=0)
     pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(z["xyz"])
-    pcd.colors = o3d.utility.Vector3dVector(z["rgb"] / 255.0)
-    pcd.normals = o3d.utility.Vector3dVector(z["vdir"].astype(np.float64))  # carried through the voxel filter
-    ext = np.ptp(z["xyz"], axis=0)
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    del xyz
+    pcd.colors = o3d.utility.Vector3dVector(rgb / 255.0)
+    del rgb
+    pcd.normals = o3d.utility.Vector3dVector(vdir.astype(np.float64))  # carried through the voxel filter
+    del vdir
     area = max(float(ext[0] * ext[1]), 1e-6)
     if len(pcd.points) > max_points:
         pcd = pcd.voxel_down_sample(max(spacing, math.sqrt(area / max_points)))
