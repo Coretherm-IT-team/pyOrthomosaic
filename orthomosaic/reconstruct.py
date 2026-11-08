@@ -753,6 +753,16 @@ def _products(ar, rec, out_dir, opt, t0, surface: Optional[Surface] = None,
                     outputs.pop("dense_las")
             else:
                 log.warning("LAZ needs `pip install \"laspy[lazrs]\"`; wrote dense.las instead")
+    classification = (dict(ground=int((cls == 2).sum()), building=int((cls == 6).sum()),
+                           vegetation=int(((cls == 3) | (cls == 5)).sum()),
+                           classes="ASPRS 2 ground / 3 low veg / 5 high veg / 6 building")
+                      if cls is not None else None)
+    n_points = int(len(xyz))
+    # the per-point export arrays (warped copy, cell indices, classes: ~41 bytes per point) are
+    # done with; free them before meshing instead of carrying them to the end of the run
+    xyz_out = cls = xs = ys = xyz = col = None
+    from .backend import release_memory
+    release_memory()
 
     # ---- mesh: Poisson surface from the dense cloud (Pix4D stage 2), else a 2.5D mesh from the DSM
     mesh_info = None
@@ -760,10 +770,15 @@ def _products(ar, rec, out_dir, opt, t0, surface: Optional[Surface] = None,
     if want_mesh and cloud is not None and opt.mesh_method in ("auto", "poisson"):
         t = time.time()
         log.info("Meshing the dense cloud (screened Poisson)")
-        vdir = rec.C[cloud.cam] - cloud.xyz
-        vdir /= np.linalg.norm(vdir, axis=1, keepdims=True)
-        m = export.poisson_mesh(cloud.xyz, cloud.rgb, vdir, cloud.spacing,
-                                max_points=2 * opt.mesh_max_vertices, max_vertices=opt.mesh_max_vertices)
+        # reduce the (memory-mapped) cloud to the Poisson input here, streamed, instead of
+        # copying all of it (and its view directions) into memory and into the worker
+        pts, prgb, pdir, ext = export.mesh_input(cloud.xyz, cloud.rgb, cloud.cam, rec.C, cloud.spacing,
+                                                 max_points=2 * opt.mesh_max_vertices)
+        log.info("Mesh input: %d points from %d", len(pts), len(cloud.xyz))
+        m = export.poisson_mesh(pts, prgb, pdir, cloud.spacing,
+                                max_points=max(len(pts), 2 * opt.mesh_max_vertices),
+                                max_vertices=opt.mesh_max_vertices, extent=ext)
+        del pts, prgb, pdir
         if m is None:
             log.warning("Poisson mesh unavailable (install open3d, see above for errors): mesh built from the DSM")
         else:
@@ -842,12 +857,8 @@ def _products(ar, rec, out_dir, opt, t0, surface: Optional[Surface] = None,
                                 float(np.median([g[1] for g in gains.values()])) if gains else 1.0,
                                 float(np.median([g[2] for g in gains.values()])) if gains else 1.0]),
         contours=dict(interval=float(getattr(opt, "contour_interval", 0.0)), levels=len(contours)) if contours else None,
-        classification=dict(ground=int((cls == 2).sum()) if cls is not None else 0,
-                            building=int((cls == 6).sum()) if cls is not None else 0,
-                            vegetation=int(((cls == 3) | (cls == 5)).sum()) if cls is not None else 0,
-                            classes="ASPRS 2 ground / 3 low veg / 5 high veg / 6 building")
-        if cls is not None else None,
-        dense_points=int(len(xyz)), outputs=outputs, seconds=round(time.time() - t0, 1),
+        classification=classification,
+        dense_points=n_points, outputs=outputs, seconds=round(time.time() - t0, 1),
         thermal=(dict(raw_range=list(ar.thermal_range), units=ar.thermal_units, palette=opt.palette, contrast=opt.contrast,
                       raw_values="orthophoto_thermal.tif", measurement=measurement_summary(frames),
                       legend="thermal_legend.png",
