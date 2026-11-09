@@ -94,6 +94,10 @@ class Options3D(Options):
     contour_interval: float = 0.0           # metres between terrain contour lines (0 = off)
     contour_resolution: float = 1.0         # m: contours are traced on the DTM resampled to this (Pix4D: 100 cm)
     classify_cloud: bool = True             # ASPRS ground/building/vegetation classes in the LAS
+    # bound thermal (build_thermal_bound): "timed-rig" places each thermal photo on the RGB trajectory
+    # at its own exposure time, attitude = RGB twin x rig, no thermal-only refinement, pairs also by
+    # DJI frame number; "legacy" = thermal centre at its RGB twin's, thermal-SfM attitudes refined
+    thermal_placement: str = "timed-rig"
     # ground control points (survey anchors)
     gcp: Optional[str] = None               # path to a WebODM/Pix4D GCP list file
     gcp_sigma: float = 0.05                 # surveyed GCP accuracy in metres
@@ -162,15 +166,25 @@ class GpsWarp:
         self.L, self.t, self.c = np.asarray(L, float), np.asarray(t, float), np.asarray(c, float)
         self.Li = np.linalg.inv(self.L)
 
+    BLOCK = 1 << 21                                     # rows per matrix product in `xy`
+
     def xy(self, P):
         """Transform (n, >=2) local coordinates (x, y columns), returning a copy."""
         P = np.asarray(P)
         Q = np.array(P, np.float64 if P.dtype.kind != "f" else P.dtype, copy=True)
         off = self.t + self.c - self.c @ self.L.T
-        for i in range(0, len(Q), 1 << 21):            # chunks: dense clouds have tens of millions
-            xy = Q[i:i + (1 << 21), :2].astype(np.float64)
-            Q[i:i + (1 << 21), :2] = xy @ self.L.T + off
+        for i in range(0, len(Q), self.BLOCK):          # chunks: dense clouds have tens of millions
+            xy = Q[i:i + self.BLOCK, :2].astype(np.float64)
+            Q[i:i + self.BLOCK, :2] = xy @ self.L.T + off
         return Q
+
+    def xy_rows(self, P, a: int, b: int):
+        """Rows a..b of ``xy(P)`` without transforming all of P: each product is made on the same
+        BLOCK-aligned rows as `xy` does, so the values are bit-identical."""
+        lo, hi = a // self.BLOCK * self.BLOCK, min(len(P), -(-b // self.BLOCK) * self.BLOCK)
+        Q = np.concatenate([self.xy(P[i:min(hi, i + self.BLOCK)]) for i in range(lo, hi, self.BLOCK)]) \
+            if hi > lo else self.xy(P[a:b])
+        return Q[a - lo:b - lo] if hi > lo else Q
 
     def grid(self, origin_xy, gsd, W, H, offset):
         """Output grid (origin, W, H) covering the warped source grid, same cell size."""
@@ -703,16 +717,25 @@ def _products(ar, rec, out_dir, opt, t0, surface: Optional[Surface] = None,
     s = max(1, opt.cloud_step)
     want_cloud = "ply" in opt.formats or "las" in opt.formats or "laz" in opt.formats
     if cloud is not None:
-        # views of the (memory-mapped) cloud; the per-point arrays below are only made for an export
+        # views of the (memory-mapped) cloud. Every per-point array of the export (GPS-warped
+        # coordinates, DSM cell, class) is made one block at a time while the files are written
+        # (export.RowBlocks): ~0.5 GB whatever the cloud size, instead of ~60 bytes per point
+        # (275 M points: ~17 GB) held at once. The files are byte-identical.
         xyz, col = cloud.xyz[::s], cloud.rgb[::s]
-        if "las" in opt.formats or "laz" in opt.formats:
-            xs = np.clip(((xyz[:, 0] - dense.minX) / gsd).astype(np.int64), 0, dsm.shape[1] - 1)
-            ys = np.clip(((dense.maxY - xyz[:, 1]) / gsd).astype(np.int64), 0, dsm.shape[0] - 1)
+
+        def cells(a, b):
+            blk = xyz[a:b]
+            return (np.clip(((dense.maxY - blk[:, 1]) / gsd).astype(np.int64), 0, dsm.shape[0] - 1),
+                    np.clip(((blk[:, 0] - dense.minX) / gsd).astype(np.int64), 0, dsm.shape[1] - 1))
     else:
         ys, xs = np.nonzero(conf[::s, ::s])
         ys, xs = ys * s, xs * s
         xyz = np.column_stack([dense.minX + (xs + 0.5) * gsd, dense.maxY - (ys + 0.5) * gsd, dense.Z[ys, xs]])
         col = (colors if colors.shape[:2] == dsm.shape else dense.rgb)[ys, xs]
+
+        def cells(a, b):
+            return ys[a:b], xs[a:b]
+    n_points = int(len(xyz))
     cls = None                                       #changed here: ASPRS classes (set with the LAS)
     outputs = {"dsm": "dsm.tif", "orthophoto": "orthophoto.tif", "sparse": "sparse.ply",
                "valid_mask": "valid_mask.tif", "dsm_support": "dsm_support.tif", "overlap": "overlap.tif"}
@@ -722,23 +745,33 @@ def _products(ar, rec, out_dir, opt, t0, surface: Optional[Surface] = None,
         outputs.update(dtm="dtm.tif", ndsm="ndsm.tif")
     if contours:                                     #changed here
         outputs["contours"] = "contours.geojson"
-    xyz_out = gw(xyz) if want_cloud else None
+    # GPS-warped coordinates, block by block (same values as gw(xyz)[a:b])
+    xyz_out = (None if not want_cloud else xyz if warp is None
+               else export.RowBlocks(n_points, lambda a, b: warp.xy_rows(xyz, a, b), 3))
     if "ply" in opt.formats:
         export.write_ply(os.path.join(out_dir, "dense.ply"), xyz_out, col, offset3, f"EPSG:{epsg}" if epsg else "")
         outputs["dense_ply"] = "dense.ply"
+    class_counts = {}                                # block -> class histogram (for the report)
     if "las" in opt.formats or "laz" in opt.formats:
         #changed here: Pix4D-style point-cloud classification for the LAS deliverable
         cls = None
         if ground is not None:
+            # per-cell classes on the DSM grid once; the per-point classes block by block
+            cls_grid = None
             if getattr(opt, "classify_cloud", True) and ndsm_raw is not None:
                 from .terrain import classify_surface
-                cls = classify_surface(dsm, ground, ndsm_raw, gsd)[ys, xs]
-            else:
-                cls = np.where(ground[ys, xs], 2, 1).astype(np.uint8)
-            if cloud is not None and cls is not None:
-                # a point well below the surface of its cell (wall, under canopy) is not ground
-                below = xyz[:, 2] < dsm[ys, xs] - 1.0
-                cls = np.where(below & (cls == 2), 1, cls).astype(np.uint8)
+                cls_grid = classify_surface(dsm, ground, ndsm_raw, gsd)
+
+            def point_classes(a, b):
+                yb, xb = cells(a, b)
+                c = cls_grid[yb, xb] if cls_grid is not None else np.where(ground[yb, xb], 2, 1).astype(np.uint8)
+                if cloud is not None:
+                    # a point well below the surface of its cell (wall, under canopy) is not ground
+                    below = xyz[a:b, 2] < dsm[yb, xb] - 1.0
+                    c = np.where(below & (c == 2), 1, c).astype(np.uint8)
+                class_counts[(a, b)] = np.bincount(c, minlength=256)
+                return c
+            cls = export.RowBlocks(n_points, point_classes)
         las_path = os.path.join(out_dir, "dense.las")
         spacing = cloud.spacing if cloud is not None else gsd * max(1, opt.cloud_step)
         export.write_las(las_path, xyz_out, col, epsg, scale=las_scale(spacing), classification=cls,
@@ -753,14 +786,13 @@ def _products(ar, rec, out_dir, opt, t0, surface: Optional[Surface] = None,
                     outputs.pop("dense_las")
             else:
                 log.warning("LAZ needs `pip install \"laspy[lazrs]\"`; wrote dense.las instead")
-    classification = (dict(ground=int((cls == 2).sum()), building=int((cls == 6).sum()),
-                           vegetation=int(((cls == 3) | (cls == 5)).sum()),
-                           classes="ASPRS 2 ground / 3 low veg / 5 high veg / 6 building")
-                      if cls is not None else None)
-    n_points = int(len(xyz))
-    # the per-point export arrays (warped copy, cell indices, classes: ~41 bytes per point) are
-    # done with; free them before meshing instead of carrying them to the end of the run
-    xyz_out = cls = xs = ys = xyz = col = None
+    classification = None
+    if cls is not None:
+        h = np.sum(list(class_counts.values()), 0) if class_counts else np.zeros(256, np.int64)
+        classification = dict(ground=int(h[2]), building=int(h[6]), vegetation=int(h[3] + h[5]),
+                              classes="ASPRS 2 ground / 3 low veg / 5 high veg / 6 building")
+    # nothing per-point is left from the export; drop the views before meshing
+    xyz_out = cls = cls_grid = xs = ys = xyz = col = None
     from .backend import release_memory
     release_memory()
 
@@ -921,8 +953,12 @@ def build_thermal_bound(rgb_images, thermal_images, out_dir, options: Optional[O
     ar_th.origin = ar_rgb.origin
 
     log.info("== Binding thermal to RGB ==")
+    placement = getattr(topt, "thermal_placement", "timed-rig")
+    if placement not in ("timed-rig", "legacy"):
+        raise ValueError(f"thermal_placement must be 'timed-rig' or 'legacy', not {placement!r}")
+    mode = (dict(attitude="rig", refine=False, timing=True, by_frame=True) if placement == "timed-rig" else {})
     rec_bound, rig = bind_thermal(rec_rgb, ar_rgb.frames, rec_th, ar_th.frames,
-                                  ground=surfaces[0].height if surfaces else None, workers=ar_th.workers)
+                                  ground=surfaces[0].height if surfaces else None, workers=ar_th.workers, **mode)
     if rig["rotation_scatter_deg"] > 2.0:
         log.warning("Rig rotation is inconsistent (scatter %.2f deg): the two cameras may not be rigidly "
                     "mounted, or the thermal-only poses are noisy (the refinement corrects attitudes "

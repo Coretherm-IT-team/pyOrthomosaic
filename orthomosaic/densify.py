@@ -566,8 +566,21 @@ class _CloudWriter:
                 f, shape = os.path.join(self.path, name), ((self.n, w) if w else (self.n,))
                 out.append(np.fromfile(f, dt).reshape(shape) if os.name == "nt"
                            else np.memmap(f, dtype=dt, mode="r", shape=shape))
-        shutil.rmtree(self.path)                     # mapped pages stay valid after the unlink (POSIX)
+        _rmtree_tolerant(self.path)                  # mapped pages stay valid after the unlink (POSIX)
         return out
+
+
+def _rmtree_tolerant(path):
+    """shutil.rmtree that tolerates entries vanishing during the walk: on exFAT/FAT drives macOS
+    keeps a ._name AppleDouble file next to each file and deletes it together with the file, so
+    rmtree then fails on '._xyz'. Any other error still raises (files left behind fill the disk)."""
+    def onerror(func, p, exc_info):
+        if not issubclass(exc_info[0], FileNotFoundError):
+            raise exc_info[1]
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)     # onerror: 3.12 prefers onexc
+        shutil.rmtree(path, onerror=onerror)
 
 
 def _densify(ar, rec, gains, biases, wd, opt, cloud_dir=None) -> DenseCloud:

@@ -44,15 +44,84 @@ def pair_key(basename: str) -> str:
     return m.group("stem") if m else basename
 
 
-def pair_frames(rgb_names, thermal_names) -> list:
-    """Return [(rgb_basename, thermal_basename)] paired by capture (shared filename stem)."""
+_SEQ = re.compile(r"^.+_(?P<seq>\d{3,6})_[A-Za-z]+\.[^.]+$")
+
+
+def frame_number(basename: str):
+    """DJI capture counter shared by an RGB/thermal pair (DJI_20260915182922_0001_V.JPG -> '0001'),
+    or None. Unlike the full stem it does not carry the second, so a pair taken across a second
+    boundary (..._091851_0010_V / ..._091852_0010_T) still matches."""
+    m = _SEQ.match(basename)
+    return m.group("seq") if m else None
+
+
+def pair_frames(rgb_names, thermal_names, by_frame: bool = False, times=None, max_dt: float = 1.0) -> list:
+    """Return [(rgb_basename, thermal_basename)] paired by capture (shared filename stem).
+
+    `by_frame` also pairs the thermal photos left over by their DJI frame number (a pair straddling
+    a second gets two different stems: 98 of 517 pairs on Lake Grove). With `times` (basename ->
+    exposure seconds) a frame-number pair must be within `max_dt` s, which also guards against a
+    counter repeated in the folder; without times the frame number must be unique."""
     rgb = {pair_key(n): n for n in rgb_names}
-    pairs = []
+    pairs, taken, left = [], set(), []
     for tn in thermal_names:
-        k = pair_key(tn)
-        if k in rgb:
-            pairs.append((rgb[k], tn))
+        r = rgb.get(pair_key(tn))
+        if r is not None:
+            pairs.append((r, tn))
+            taken.add(r)
+        else:
+            left.append(tn)
+    if not (by_frame and left):
+        return pairs
+    by_seq = {}
+    for n in rgb_names:
+        s = frame_number(n)
+        if s is not None and n not in taken:
+            by_seq.setdefault(s, []).append(n)
+    for tn in left:
+        cands = by_seq.get(frame_number(tn) or "", [])
+        if times is not None:
+            tt = times.get(tn)
+            cands = [] if tt is None else sorted(
+                (abs(times[n] - tt), n) for n in cands if times.get(n) is not None and abs(times[n] - tt) <= max_dt)
+            r = cands[0][1] if cands else None
+        else:
+            r = cands[0] if len(cands) == 1 else None
+        if r is not None:
+            pairs.append((r, tn))
+            by_seq[frame_number(tn)].remove(r)
     return pairs
+
+
+def exposure_offsets(pairs, rgb_pose, times, max_gap: float = 5.0, max_shift: float = 2.0):
+    """Where each thermal camera was when *it* fired, relative to its RGB twin's centre.
+
+    The thermal exposure comes 16-182 ms after the wide one on the M4T (UTCAtExposure), so at
+    2.75 m/s a thermal photo placed at its twin's centre sits ~14 cm short along the flight line,
+    the other way on the next line: no single shift of the map removes that. The RGB trajectory
+    (SfM centres ordered by exposure time) is interpolated linearly at the thermal exposure between
+    the two RGB shots around it. Pairs without times, at either end of the block, across a gap of
+    more than `max_gap` s or with an implausible result (> `max_shift` m) keep a zero offset.
+    -> (offsets (n, 3), dt seconds (n,), NaN where untimed)."""
+    n = len(pairs)
+    off, dts = np.zeros((n, 3)), np.full(n, np.nan)
+    track = sorted((times[k], k) for k in rgb_pose if times.get(k) is not None)
+    if len(track) < 2:
+        return off, dts
+    ts = np.array([t for t, _ in track])
+    Cs = np.stack([rgb_pose[k][1] for _, k in track])
+    for i, (r, t) in enumerate(pairs):
+        tv, tt = times.get(r), times.get(t)
+        if tv is None or tt is None:
+            continue
+        j = int(np.searchsorted(ts, tt))
+        if j <= 0 or j >= len(ts) or not 1e-3 < ts[j] - ts[j - 1] <= max_gap:
+            continue
+        a = (tt - ts[j - 1]) / (ts[j] - ts[j - 1])
+        d = Cs[j - 1] + a * (Cs[j] - Cs[j - 1]) - rgb_pose[r][1]
+        if np.linalg.norm(d) <= max_shift:
+            off[i], dts[i] = d, tt - tv
+    return off, dts
 
 
 @dataclass
@@ -226,7 +295,8 @@ def refine_bound(rec, C_target, R_target, ground=None, pos_sigma: float = 0.05, 
 
 
 def bind_thermal(rec_rgb, frames_rgb, rec_thermal, frames_thermal, refine: bool = True,
-                 lever_arm: bool = False, ground=None, attitude: str = "thermal", workers: int = 0):
+                 lever_arm: bool = False, ground=None, attitude: str = "thermal", workers: int = 0,
+                 timing: bool = False, by_frame: bool = False):
     """Rebind the thermal reconstruction's camera poses to the RGB block through a shared rig.
 
     Both reconstructions must be in the same local frame (see `rebase`). Returns the thermal
@@ -235,19 +305,32 @@ def bind_thermal(rec_rgb, frames_rgb, rec_thermal, frames_thermal, refine: bool 
     twin's (the thermal SfM cannot measure a cm-level baseline). Attitudes start from the thermal
     SfM's own (`attitude="thermal"`): they already fit the thermal tie points, while RGB x mean rig
     carries the rig's per-frame scatter (1.4 deg on 050, ~50 px). `refine` then adjusts the thermal
-    lens and attitudes with the centres pinned and the tie points on `ground` (`refine_bound`)."""
+    lens and attitudes with the centres pinned and the tie points on `ground` (`refine_bound`).
+
+    `timing` moves each thermal centre along the RGB trajectory to the thermal photo's own exposure
+    time (`exposure_offsets`); `attitude="rig"` takes every thermal attitude from its RGB twin
+    through the rig. With `refine=False` that is the "timed rig" placement: on Lake Grove (2.75 m/s)
+    it cut the tiles over 20 cm from 14 % to 4 %, where the thermal-only refinement re-fits the
+    attitudes to the noisier thermal tie points. `by_frame` also pairs photos by DJI frame number;
+    those extra pairs are placed but the rig is still estimated from the name-paired ones (adding
+    them to the estimate moved the rig ~0.3 deg on Lake Grove)."""
     rgb_pose = {frames_rgb[g].name: (rec_rgb.R[k], rec_rgb.C[k]) for k, g in enumerate(rec_rgb.used)}
     th_local = {frames_thermal[g].name: k for k, g in enumerate(rec_thermal.used)}
-    pairs = pair_frames(list(rgb_pose), list(th_local))
+    times = {f.name: getattr(f, "exposure_time", None) for f in list(frames_rgb) + list(frames_thermal)}
+    pairs = pair_frames(list(rgb_pose), list(th_local), by_frame=by_frame,
+                        times=times if any(v is not None for v in times.values()) else None)
     pairs = [(r, t) for r, t in pairs if t in th_local]
     if len(pairs) < 3:
         raise RuntimeError(f"Only {len(pairs)} RGB/thermal pairs found; cannot estimate the rig")
+    by_name = np.array([pair_key(r) == pair_key(t) for r, t in pairs])
+    if by_name.sum() < 3:
+        by_name[:] = True
 
     R_V = np.stack([rgb_pose[r][0] for r, t in pairs])
     C_V = np.stack([rgb_pose[r][1] for r, t in pairs])
     R_T = np.stack([rec_thermal.R[th_local[t]] for r, t in pairs])
     C_T = np.stack([rec_thermal.C[th_local[t]] for r, t in pairs])
-    rig = estimate_rig(R_V, C_V, R_T, C_T)
+    rig = estimate_rig(R_V[by_name], C_V[by_name], R_T[by_name], C_T[by_name])
     log.info("Rig: %d/%d consistent pairs, rotation scatter %.3f deg, translation scatter %.3f m, "
              "baseline %.3f m", rig.n_inliers, rig.n_pairs, rig.rot_scatter_deg, rig.trans_scatter_m,
              float(np.linalg.norm(rig.t_rel)))
@@ -259,6 +342,25 @@ def bind_thermal(rec_rgb, frames_rgb, rec_thermal, frames_thermal, refine: bool 
     R_new, C_new = apply_rig(used_rig, R_V, C_V)
     if attitude == "thermal":
         R_new = R_T.copy()
+    placement = dict(attitude=attitude, refined=bool(refine), timing=bool(timing), pairs=len(pairs),
+                     pairs_by_name=int(by_name.sum()), pairs_by_frame_number=int((~by_name).sum()))
+    if timing:
+        off, dts = exposure_offsets(pairs, rgb_pose, times)
+        C_new = C_new + off
+        ok = np.isfinite(dts)
+        if ok.any():
+            sh = np.linalg.norm(off[ok, :2], axis=1)
+            placement.update(timed=int(ok.sum()), dt_ms_median=float(np.median(dts[ok]) * 1e3),
+                             dt_ms_range=[float(dts[ok].min() * 1e3), float(dts[ok].max() * 1e3)],
+                             shift_m_median=float(np.median(sh)), shift_m_p90=float(np.percentile(sh, 90)),
+                             shift_m_max=float(sh.max()))
+            log.info("Thermal exposure timing: %d/%d photos moved to their own exposure (thermal %.0f ms after "
+                     "the wide, %.0f..%.0f), shift median %.3f m, p90 %.3f m, max %.3f m", ok.sum(), len(pairs),
+                     placement["dt_ms_median"], *placement["dt_ms_range"], placement["shift_m_median"],
+                     placement["shift_m_p90"], placement["shift_m_max"])
+        else:
+            placement["timed"] = 0
+            log.warning("Thermal exposure timing: no UTCAtExposure in the photos, thermal kept at the RGB centres")
     remap = {old: new for new, old in enumerate(keep_local)}
     rec = rec_thermal
     rec.R = np.ascontiguousarray(R_new)
@@ -283,7 +385,8 @@ def bind_thermal(rec_rgb, frames_rgb, rec_thermal, frames_thermal, refine: bool 
                 rig_translation_m=[float(v) for v in rig.t_rel],
                 rig_baseline_m=float(np.linalg.norm(rig.t_rel)),
                 rotation_scatter_deg=rig.rot_scatter_deg, translation_scatter_m=rig.trans_scatter_m,
-                pairs=rig.n_pairs, inliers=rig.n_inliers, lever_arm_applied=bool(lever_arm), attitude_seed=attitude)
+                pairs=rig.n_pairs, inliers=rig.n_inliers, lever_arm_applied=bool(lever_arm), attitude_seed=attitude,
+                placement=placement)
     if refine and len(rec.obs_pt):
         diag["refinement"] = refine_bound(rec, C_new, R_new, ground=ground, workers=workers)
     return rec, diag

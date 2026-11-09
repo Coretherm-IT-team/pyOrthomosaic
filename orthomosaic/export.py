@@ -23,8 +23,45 @@ from PIL import Image
 _CHUNK = 4_000_000          # points per block when writing large clouds (bounded memory, same bytes)
 
 
+class RowBlocks:
+    """Rows of a large per-point array, made on demand: ``make(a, b)`` returns rows a..b.
+
+    The writers below only read contiguous row slices (``x[a:b]``, ``x[a:b, j]``), so they can take
+    this in place of a full array: a 275 M-point cloud's warped coordinates or classes never exist
+    in memory at once, only the block being written. The last block is kept, so reading its
+    columns one by one computes it once."""
+
+    def __init__(self, n: int, make, width: Optional[int] = None):
+        self.n, self.make, self.width = int(n), make, width
+        self._key = self._blk = None
+
+    def __len__(self):
+        return self.n
+
+    @property
+    def ndim(self):
+        return 1 if self.width is None else 2
+
+    @property
+    def shape(self):
+        return (self.n,) if self.width is None else (self.n, self.width)
+
+    def __getitem__(self, idx):
+        col = None
+        if isinstance(idx, tuple):
+            idx, col = idx
+        if not isinstance(idx, slice) or idx.step not in (None, 1):
+            raise TypeError("RowBlocks supports contiguous row slices only")
+        a, b, _ = idx.indices(self.n)
+        if self._key != (a, b):
+            self._blk, self._key = None, None          # drop the old block before making the next
+            self._blk, self._key = self.make(a, b), (a, b)
+        return self._blk if col is None else self._blk[:, col]
+
+
 def write_ply(path: str, xyz: np.ndarray, rgb: np.ndarray, offset=(0.0, 0.0, 0.0), comment: str = ""):
-    """Binary little-endian PLY. Coordinates are stored relative to `offset` (float32)."""
+    """Binary little-endian PLY. Coordinates are stored relative to `offset` (float32).
+    `xyz` may be a `RowBlocks` (written one block at a time)."""
     n = len(xyz)
     header = ["ply", "format binary_little_endian 1.0",
               f"comment offset {offset[0]:.3f} {offset[1]:.3f} {offset[2]:.3f}"]
@@ -48,17 +85,22 @@ def write_las(path: str, xyz_abs: np.ndarray, rgb: np.ndarray, epsg: Optional[in
     """LAS 1.2, point format 2 (XYZ + RGB), absolute coordinates, optional EPSG GeoKey VLR.
     classification: optional per-point ASPRS class (1 = unclassified, 2 = ground).
     add: optional (3,) offset added to `xyz_abs` block by block (the file is the same as for
-    ``write_las(path, xyz_abs + add, ...)`` without the full-size sum in memory)."""
+    ``write_las(path, xyz_abs + add, ...)`` without the full-size sum in memory).
+    `xyz_abs` and `classification` may be `RowBlocks`: memory then stays at one block."""
     n = len(xyz_abs)
 
     def coords(c0, c1):
         blk = xyz_abs[c0:c1]
         return blk if add is None else blk + add
     if n > _CHUNK:
-        parts = [coords(c0, min(n, c0 + _CHUNK)) for c0 in range(0, n, _CHUNK)]
-        mins = np.min([p.min(0) for p in parts], 0)
-        maxs = np.max([p.max(0) for p in parts], 0)
-        del parts
+        # running min / max: one block in memory at a time (np.minimum propagates NaN like np.min)
+        mins = maxs = None
+        for c0 in range(0, n, _CHUNK):
+            p = coords(c0, min(n, c0 + _CHUNK))
+            lo, hi = p.min(0), p.max(0)
+            mins = lo if mins is None else np.minimum(mins, lo)
+            maxs = hi if maxs is None else np.maximum(maxs, hi)
+            del p
         if not (np.all(np.isfinite(mins) & (mins != 0)) and np.all(np.isfinite(maxs) & (maxs != 0))):
             full = coords(0, n)              # +-0 / NaN ties: the original whole-array reduction
             mins, maxs = full.min(0), full.max(0)

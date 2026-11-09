@@ -37,6 +37,7 @@ class Frame:
     speed_z: Optional[float] = None     # DJI XMP FlightZSpeed (m/s, down)
     shutter: Optional[str] = None       # DJI XMP ShutterType ("Electronic" = rolling shutter)
     gps_std_h: Optional[float] = None   # DJI XMP RtkStdLat/Lon: RTK horizontal 1-sigma (m)
+    exposure_time: Optional[float] = None  # DJI XMP UTCAtExposure as POSIX seconds (us resolution)
     make: str = ""
     model: str = ""
     raw_shape: Optional[tuple] = None     # (h, w) of embedded radiometric thermal data (DJI R-JPEG)
@@ -108,6 +109,15 @@ def _read_dji_xmp(path: str, fr: "Frame"):
     m = re.search(rb'drone-dji:ShutterType="([A-Za-z]+)"', head)
     if m:
         fr.shutter = m.group(1).decode()
+    # the thermal and wide cameras of a dual sensor fire tens of ms apart (binding uses the gap)
+    m = re.search(rb'drone-dji:UTCAtExposure="([0-9T:.\-]+)"', head)
+    if m:
+        import datetime as _dt
+        try:
+            fr.exposure_time = _dt.datetime.fromisoformat(m.group(1).decode()).replace(
+                tzinfo=_dt.timezone.utc).timestamp()
+        except ValueError:
+            pass
 
 
 def read_frame(path: str) -> Frame:

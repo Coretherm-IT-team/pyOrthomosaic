@@ -334,6 +334,40 @@ def test_chunked_writers_same_bytes():
         export._CHUNK = old_chunk
 
 
+def test_streamed_cloud_export_same_bytes():
+    """The dense-cloud export makes the warped coordinates and classes block by block
+    (RowBlocks, GpsWarp.xy_rows); the PLY / LAS must equal the full-array writers bit for bit."""
+    import tempfile
+    from orthomosaic import export
+    from orthomosaic.reconstruct import GpsWarp
+    rng = np.random.default_rng(11)
+    n = 2500
+    xyz = np.column_stack([rng.uniform(-50, 50, n), rng.uniform(-50, 50, n), rng.uniform(-5, 30, n)])
+    rgb = rng.integers(0, 256, (n, 3)).astype(np.uint8)
+    cls = rng.integers(1, 7, n).astype(np.uint8)
+    off = np.array([592264.0, 4525733.0, 0.0])
+    warp = GpsWarp([[1.0013, 0.0021], [-0.0017, 0.9981]], [0.12, -0.07], [3.0, -4.0])
+    old_chunk, old_block = export._CHUNK, GpsWarp.BLOCK
+    try:
+        GpsWarp.BLOCK = 256                           # warp products on 256-row blocks, like 2**21
+        full = warp.xy(xyz)
+        for a, b in ((0, n), (100, 900), (255, 257), (2400, n), (7, 7)):
+            assert _same(warp.xy_rows(xyz, a, b), full[a:b])
+        lazy = export.RowBlocks(n, lambda a, b: warp.xy_rows(xyz, a, b), 3)
+        lazy_cls = export.RowBlocks(n, lambda a, b: cls[a:b])
+        with tempfile.TemporaryDirectory() as d:
+            p = lambda name: os.path.join(d, name)  # noqa: E731
+            export._CHUNK = 333                       # writer blocks not aligned to the warp blocks
+            export.write_ply(p("a.ply"), full, rgb, off, "EPSG:32618")
+            export.write_ply(p("b.ply"), lazy, rgb, off, "EPSG:32618")
+            assert open(p("a.ply"), "rb").read() == open(p("b.ply"), "rb").read()
+            export.write_las(p("a.las"), full, rgb, 32618, scale=0.001, classification=cls, add=off)
+            export.write_las(p("b.las"), lazy, rgb, 32618, scale=0.001, classification=lazy_cls, add=off)
+            assert open(p("a.las"), "rb").read() == open(p("b.las"), "rb").read()
+    finally:
+        export._CHUNK, GpsWarp.BLOCK = old_chunk, old_block
+
+
 def test_box_edge_mean_matches_cumsum_box():
     from orthomosaic import _fast
     from orthomosaic.mvs import _box_mean

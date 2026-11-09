@@ -21,6 +21,38 @@ def test_pairing():
                      ("DJI_20260915182926_0003_V.JPG", "DJI_20260915182926_0003_T.JPG")]
 
 
+def test_pairing_by_frame_number_across_a_second():
+    # the 0010 pair straddles a second: different stems, same frame number and ~10 ms apart
+    rgb = ["DJI_20261029091851_0010_V.JPG", "DJI_20261029091852_0011_V.JPG", "DJI_20261029091854_0012_V.JPG"]
+    thr = ["DJI_20261029091852_0010_T.JPG", "DJI_20261029091852_0011_T.JPG", "DJI_20261029091859_0012_T.JPG"]
+    assert len(binding.pair_frames(rgb, thr)) == 1
+    times = {rgb[0]: 10.72, thr[0]: 10.73, rgb[1]: 12.23, thr[1]: 12.26, rgb[2]: 14.0, thr[2]: 19.0}
+    pairs = binding.pair_frames(rgb, thr, by_frame=True, times=times)
+    # 0012 is the same counter but 5 s apart (counter reused): not a pair
+    assert sorted(pairs) == [(rgb[0], thr[0]), (rgb[1], thr[1])]
+    assert binding.frame_number(thr[0]) == "0010" and binding.frame_number("IMG.JPG") is None
+
+
+def test_exposure_offsets_follow_the_flight_line():
+    # two lines flown in opposite directions at 3 m/s, one shot every 2 s; thermal fires 50 ms late
+    names, pose, times, pairs = [], {}, {}, []
+    for k in range(10):
+        line, step = divmod(k, 5)
+        x = 3.0 * 2 * step if line == 0 else 3.0 * 2 * (4 - step)
+        t = 2.0 * k
+        v = f"DJI_{k:04d}_V.JPG"
+        pose[v] = (np.eye(3), np.array([x, 20.0 * line, 30.0]))
+        times[v], times[v.replace("_V", "_T")] = t, t + 0.05
+        pairs.append((v, v.replace("_V", "_T")))
+    off, dts = binding.exposure_offsets(pairs, pose, times)
+    np.testing.assert_allclose(dts[np.isfinite(dts)], 0.05)
+    # inside each line: 15 cm along the direction of flight, opposite on the return line
+    np.testing.assert_allclose(off[1], [0.15, 0, 0], atol=1e-9)
+    np.testing.assert_allclose(off[6], [-0.15, 0, 0], atol=1e-9)
+    # the very last shot has nothing after it: left at its twin
+    assert np.isnan(dts[-1]) and not off[-1].any()
+
+
 def test_estimate_rig_recovers_known_offset():
     rng = np.random.default_rng(0)
     n = 40
