@@ -93,9 +93,11 @@ def test_cloud_writer_disk_equals_memory():
         assert _CloudWriter(os.path.join(tmp, "empty")).finish() is None
 
 
-def test_fusion_same_cloud_with_one_blas_thread():
-    """Fusion runs with BLAS held to one thread (densify._one_blas_thread): the same cloud, to the
-    bit, as with BLAS on all its threads. Tilted cameras, so the 3x3 products are not trivial."""
+def test_fusion_holds_blas_to_one_thread():
+    """Fusion runs with BLAS held to one thread (densify._one_blas_thread) and gives BLAS its threads
+    back afterwards; held to one thread, the cloud is the same to the bit however many neighbours are
+    projected at once. (Against BLAS on all its threads the last bits can differ: some CPUs round the
+    products differently per thread count.) Tilted cameras, so the 3x3 products are not trivial."""
     from concurrent.futures import ThreadPoolExecutor
     from types import SimpleNamespace
     W, H, f = 640, 480, 500.0
@@ -116,22 +118,27 @@ def test_fusion_same_cloud_with_one_blas_thread():
     nbrs = [[j for j in range(4) if j != k] for k in range(4)]
     rgb = np.zeros((H, W, 3), np.uint8)
 
-    def fuse(limit):
+    def blas_threads():
+        try:
+            from threadpoolctl import threadpool_info
+        except ImportError:
+            return None
+        return [i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas"]
+
+    def fuse(neighbour_threads):
         used = {k: np.zeros((H, W), bool) for k in range(4)}
         w = _CloudWriter(None)
-        with ThreadPoolExecutor(3) as fp, (densify._one_blas_thread() if limit else densify.contextlib.nullcontext()):
+        with ThreadPoolExecutor(neighbour_threads) as fp, densify._one_blas_thread():
+            inside = blas_threads()
             densify._fuse(list(range(4)), dm, used, cams, nbrs, set(range(4)), lambda k: {j: 0.05 for j in nbrs[k]},
                           SimpleNamespace(point_stride=1), 2.0, 2, lambda k: (None, rgb, cams[k]),
                           SimpleNamespace(clear=lambda: None), w, 100, fp)
-            if limit:
-                try:
-                    from threadpoolctl import threadpool_info
-                    assert all(i["num_threads"] == 1 for i in threadpool_info() if i["user_api"] == "blas")
-                except ImportError:
-                    pass
-        return w.finish()
+        return w.finish(), inside
 
-    a, b = fuse(False), fuse(True)
+    before = blas_threads()
+    (a, inside), (b, _) = fuse(1), fuse(3)
+    assert blas_threads() == before                              # BLAS has its threads back
+    assert inside is None or all(n == 1 for n in inside)
     assert a is not None and len(a[0]) > 1000
     for x, y in zip(a, b):
         assert same_bits(np.asarray(x), np.asarray(y))
@@ -139,6 +146,6 @@ def test_fusion_same_cloud_with_one_blas_thread():
 
 if __name__ == "__main__":
     for t in (test_row_bands, test_banded_rasterize_matches_unique_reference, test_cloud_writer_disk_equals_memory,
-              test_fusion_same_cloud_with_one_blas_thread):
+              test_fusion_holds_blas_to_one_thread):
         t()
         print("ok", t.__name__)

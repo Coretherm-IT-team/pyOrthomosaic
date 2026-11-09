@@ -777,8 +777,10 @@ def _one_blas_thread():
     """Fusion projects every neighbour in its own thread, and each multiplies (n, 3) points by 3x3
     matrices in NumPy. BLAS splits each of those products over all its own threads too, and the
     threads then mostly wait on each other: 4 neighbour threads were only 1.2x faster than one.
-    With one BLAS thread each, fusion is 1.6x faster. BLAS gives the same bits whatever its thread
-    count, so the cloud is unchanged. Needs threadpoolctl; without it nothing changes."""
+    With one BLAS thread each, fusion is 1.6x faster. Some CPUs' BLAS rounds these products
+    differently on a different number of threads (GitHub's x86 and ARM runners, not a Haswell-class
+    desktop): there the cloud changes in the last bits once, and then no longer depends on how many
+    cores the machine has. Needs threadpoolctl; without it nothing changes."""
     try:
         from threadpoolctl import threadpool_limits
     except ImportError:
