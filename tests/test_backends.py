@@ -66,6 +66,57 @@ def test_gpu_backends_match_cpu():
         print("ok", gpu.name, "matches cpu")
 
 
+def test_true_orthophoto_on_a_gpu_backend_renders_like_the_cpu():
+    """GPU backends hand work over one tile at a time, and the true orthophoto's per-tile work is
+    mostly CPU, so on a GPU it renders with the CPU backend on every core: the same bytes, and
+    never the GPU's sampler. Runs without a GPU: the stand-in only behaves like a GPU backend."""
+    import gc
+    import shutil
+    import tempfile
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    from orthomosaic.camera import Intrinsics
+    from orthomosaic.imageio import read_frame
+    from orthomosaic.ortho import true_orthophoto
+
+    class OneTileAtATime(CPUBackend):
+        name, parallel_blocks = "cuda", False
+
+        def sample_view(self, *args):
+            raise AssertionError("the true orthophoto sampled with the GPU backend")
+
+    f, Z = 200.0, 30.0
+    R = np.diag([1.0, -1.0, -1.0])                               # nadir: image x = east, y = south
+    rec = SimpleNamespace(used=[0, 1], R=np.stack([R, R]), C=np.stack([[-2.0, 0.0, Z], [2.5, 0.4, Z]]),
+                          intr=[Intrinsics(160, 128, f)], cam_group=np.zeros(2, np.int32))
+    dsm = np.zeros((100, 120), np.float32)
+    rng = np.random.default_rng(1)
+    out = {}
+    d = tempfile.mkdtemp()
+    try:
+        frames = []
+        for k in range(2):
+            p = os.path.join(d, f"f{k}.jpg")
+            Image.fromarray(rng.integers(0, 256, (128, 160, 3), dtype=np.uint8)).save(p, quality=95)
+            frames.append(read_frame(p))
+        for be in (CPUBackend(), OneTileAtATime()):
+            ar = SimpleNamespace(frames=frames, backend=be, workers=2)
+            rgba, src, cnt, tmp = true_orthophoto(ar, rec, dsm, -6.0, 5.0, 0.1, opt=SimpleNamespace(ortho_tile=32))
+            out[be.name] = [np.array(a) for a in (rgba, src, cnt)]
+            del rgba, src, cnt
+            gc.collect()                                         # Windows: no file stays mapped
+            shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert (out["cpu"][0][..., 3] > 0).mean() > 0.9
+    for a, b in zip(out["cpu"], out["cuda"]):
+        assert (a == b).all()
+
+
 if __name__ == "__main__":
     test_gpu_backends_match_cpu()
     print("ok test_gpu_backends_match_cpu")
+    test_true_orthophoto_on_a_gpu_backend_renders_like_the_cpu()
+    print("ok test_true_orthophoto_on_a_gpu_backend_renders_like_the_cpu")

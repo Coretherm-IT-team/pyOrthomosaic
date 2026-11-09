@@ -301,9 +301,10 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     opt = opt if opt is not None else _Defaults()
     g = lambda name: getattr(opt, name, getattr(_Defaults, name))
     backend = ar.backend
-    if not backend.parallel_blocks and backend.name == "mps":
-        # On Apple GPUs the per-tile work is mostly CPU (scoring, visibility, seams), and GPU
-        # backends process tiles one at a time: use the C sampler with all cores instead.
+    if not backend.parallel_blocks:
+        # On a GPU the per-tile work is still mostly CPU (scoring, visibility, seams, blending),
+        # and GPU backends process tiles one at a time, so the render ran on one core (CUDA: the
+        # GPU ~3% busy for 22 min on a 1117-photo flight). Use the C sampler with all cores instead.
         from .backend import CPUBackend
         backend = CPUBackend()
     frames = ar.frames
