@@ -29,6 +29,7 @@ Pure numpy; images are matched at `max_image_dim` (long side), i.e. about Pix4D'
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -705,8 +706,9 @@ def _densify(ar, rec, gains, biases, wd, opt, cloud_dir=None) -> DenseCloud:
     writer = _CloudWriter(cloud_dir)
     fpool = ThreadPoolExecutor(max(1, min(workers, opt.neighbors or 1)))
     try:
-        _fuse(sorted(have), dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache,
-              writer, step, fpool)
+        with _one_blas_thread():
+            _fuse(sorted(have), dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache,
+                  writer, step, fpool)
     finally:
         fpool.shutdown()
     del dm, used
@@ -769,6 +771,19 @@ def _repair_pass(have, wd, nbrs, cams, rec, views, cache, opt, px_tol, min_views
     cache.clear()
     log.info("Depth-map repair done in %.1fs (%d of %d pixels re-estimated by PatchMatch)",
              time.time() - t2, stats["active"], stats["pixels"])
+
+
+def _one_blas_thread():
+    """Fusion projects every neighbour in its own thread, and each multiplies (n, 3) points by 3x3
+    matrices in NumPy. BLAS splits each of those products over all its own threads too, and the
+    threads then mostly wait on each other: 4 neighbour threads were only 1.2x faster than one.
+    With one BLAS thread each, fusion is 1.6x faster. BLAS gives the same bits whatever its thread
+    count, so the cloud is unchanged. Needs threadpoolctl; without it nothing changes."""
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        return contextlib.nullcontext()
+    return threadpool_limits(1, user_api="blas")
 
 
 def _fuse(order, dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache, writer, step, fpool):

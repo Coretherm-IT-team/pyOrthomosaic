@@ -93,7 +93,52 @@ def test_cloud_writer_disk_equals_memory():
         assert _CloudWriter(os.path.join(tmp, "empty")).finish() is None
 
 
+def test_fusion_same_cloud_with_one_blas_thread():
+    """Fusion runs with BLAS held to one thread (densify._one_blas_thread): the same cloud, to the
+    bit, as with BLAS on all its threads. Tilted cameras, so the 3x3 products are not trivial."""
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    W, H, f = 640, 480, 500.0
+    cams = []
+    for k, (cx_, cy_) in enumerate([(0.0, 0.0), (6.0, 0.0), (0.0, 5.0), (6.0, 5.0)]):
+        a, b = np.radians(3.0 + k), np.radians(-2.0 + 1.5 * k)          # a few degrees off nadir
+        Rx = np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+        Ry = np.array([[np.cos(b), 0, np.sin(b)], [0, 1, 0], [-np.sin(b), 0, np.cos(b)]])
+        R = Rx @ Ry @ np.diag([1.0, -1.0, -1.0])
+        cams.append(densify._Cam(R, np.array([cx_, cy_, 20.0]), f, 0.0, 0.0, (W - 1) / 2, (H - 1) / 2, W, H, 0.0))
+    dm = {}
+    u, v = np.meshgrid(np.arange(W, dtype=np.float64), np.arange(H, dtype=np.float64))
+    for k, c in enumerate(cams):
+        x, y = c.rays(u, v)
+        dz = c.R[0, 2] * x + c.R[1, 2] * y + c.R[2, 2]                   # world z of the ray (x, y, 1)
+        d = -(c.C[2] - 0.3 * np.sin(u / 40.0)) / dz                       # a gently waved ground
+        dm[k] = d.astype(np.float32)
+    nbrs = [[j for j in range(4) if j != k] for k in range(4)]
+    rgb = np.zeros((H, W, 3), np.uint8)
+
+    def fuse(limit):
+        used = {k: np.zeros((H, W), bool) for k in range(4)}
+        w = _CloudWriter(None)
+        with ThreadPoolExecutor(3) as fp, (densify._one_blas_thread() if limit else densify.contextlib.nullcontext()):
+            densify._fuse(list(range(4)), dm, used, cams, nbrs, set(range(4)), lambda k: {j: 0.05 for j in nbrs[k]},
+                          SimpleNamespace(point_stride=1), 2.0, 2, lambda k: (None, rgb, cams[k]),
+                          SimpleNamespace(clear=lambda: None), w, 100, fp)
+            if limit:
+                try:
+                    from threadpoolctl import threadpool_info
+                    assert all(i["num_threads"] == 1 for i in threadpool_info() if i["user_api"] == "blas")
+                except ImportError:
+                    pass
+        return w.finish()
+
+    a, b = fuse(False), fuse(True)
+    assert a is not None and len(a[0]) > 1000
+    for x, y in zip(a, b):
+        assert same_bits(np.asarray(x), np.asarray(y))
+
+
 if __name__ == "__main__":
-    for t in (test_row_bands, test_banded_rasterize_matches_unique_reference, test_cloud_writer_disk_equals_memory):
+    for t in (test_row_bands, test_banded_rasterize_matches_unique_reference, test_cloud_writer_disk_equals_memory,
+              test_fusion_same_cloud_with_one_blas_thread):
         t()
         print("ok", t.__name__)

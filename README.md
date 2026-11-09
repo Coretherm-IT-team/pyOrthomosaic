@@ -18,7 +18,7 @@ Package name `pyOrthomosaic`, import name `orthomosaic`. Python ≥ 3.9.
 ## Install
 
 ```bash
-pip install pyOrthomosaic                       # CPU (numpy + pillow only)
+pip install pyOrthomosaic                       # CPU (numpy, pillow, threadpoolctl)
 pip install "pyOrthomosaic[mesh,laz]"           # + 3D mesh (open3d) + LAZ point cloud (laspy/lazrs)
 pip install "pyOrthomosaic[mps]"                # + Apple-silicon GPU (MLX)
 pip install "pyOrthomosaic[cuda]"               # + NVIDIA GPU (CuPy)
