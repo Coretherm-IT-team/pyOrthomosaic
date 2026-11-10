@@ -17,7 +17,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: GIS",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
-dependencies = ["numpy>=1.21", "pillow>=9.0"]
+dependencies = ["numpy>=1.21", "pillow>=9.0", "threadpoolctl>=3.5"]
 
 [project.optional-dependencies]
 cuda = ["cupy-cuda12x[ctk]"]   # [ctk] = CUDA headers needed for runtime kernel compilation
